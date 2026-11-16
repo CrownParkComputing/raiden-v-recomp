@@ -20,4 +20,5 @@ your supported dump with `python3 run.py prepare --game game`, then run
 `./play-raiden-v.sh`. Shared configuration names remain `TEMPEST_*`.
 
 Original packages, game files, prepared images, drivers, signing keys and saves
-remain local and excluded from Git. The APK contains no original game data.
+remain local and excluded from Git. The APK contains the runtime, driver and
+launcher art; game executables and resources are staged separately.

@@ -14,6 +14,7 @@
 - Support the bundled toolkit's local-user callback replay and offline network
   callback setup. Leave HTTP and unused online services unsupported.
 - Reach Stage 1 on Linux with clear text and 60 FPS in steady sections;
-  gameplay confirmed by the user. Further play and Android device checks remain.
+  gameplay confirmed by the user. Build and install Android v0.1/code 1; full
+  SD-card data staging and device gameplay checks remain pending.
 
 Earlier port notes are retained under `docs/legacy/`.

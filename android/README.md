@@ -93,7 +93,7 @@ When available, the local dump's `game/sce_sys/icon0.png` supplies launcher art;
 an explicit second argument or `TEMPEST_ANDROID_ICON` overrides it. Without local
 artwork, packaging uses the project-owned vector icon. Do not commit copied PS4
 artwork or signing keys. Packaging stages only the runtime, driver and launcher
-resources, with no PS4 executable or game data.
+resources, with no PS4 executables or gameplay resources.
 
 The usual Android debug key is `$HOME/.android/debug.keystore`. Keep the same key
 for subsequent `install -r` updates. Packaging requires an existing key.

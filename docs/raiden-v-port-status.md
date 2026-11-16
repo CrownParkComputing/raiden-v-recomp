@@ -62,8 +62,15 @@ with 17 optional skips, and driver ZIP fixtures pass.
 Android has a separate app identity, the shared L3+R3 settings panel and the
 bundled/system/imported driver choices. Android main, boot-check and FEX-check targets build. The signed version
 0.1/code 1 APK passes identity, ARM64/API, original-icon and bundled-driver
-provenance checks. Installation/staging is underway; device gameplay, graphics,
-audio and performance remain untested.
+provenance checks. It is installed on the Retroid and its installed hash matches
+the build. The SD-card game-data transfer was interrupted by a lost device
+connection; completing staging and checking device gameplay, graphics, audio
+and performance remain pending. The existing foreground app was left running.
+
+The source was published at commit
+`5d8cbe63da8c709af3a634801e40d9846d32347b` and the fresh Ubuntu
+[CI build and runtime/Python/driver checks passed](https://github.com/CrownParkComputing/raiden-v-recomp/actions/runs/43778487064).
+Later documentation-only updates do not change that tested runtime.
 
 Private evidence is retained under `out/` and in the CUSA07673 input review
 directory. No game assets, packages or drivers belong in the public source.
