@@ -43,6 +43,12 @@ public:
     /// Refresh the known GPU tick
     void Refresh();
 
+    /// Opt-in: query on demand instead of after every submit and around explicit waits.
+    static bool DeferCounterRefresh();
+
+    /// Tests one required tick without waiting or publishing later, unproven completion.
+    [[nodiscard]] bool Poll(u64 tick);
+
     /// Waits for a tick to be hit on the GPU
     void Wait(u64 tick);
 

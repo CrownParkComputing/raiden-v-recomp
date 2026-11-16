@@ -5,6 +5,7 @@
 #include <optional>
 
 #include "common/assert.h"
+#include "video_core/renderer_vulkan/vk_gpu_tick_cache.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_resource_pool.h"
 #include "video_core/renderer_vulkan/vk_semaphore.h"
@@ -15,37 +16,13 @@ ResourcePool::ResourcePool(Semaphore* work_semaphore_, std::size_t grow_step_)
     : work_semaphore{work_semaphore_}, grow_step{grow_step_} {}
 
 std::size_t ResourcePool::CommitResource() {
-    u64 gpu_tick = work_semaphore->KnownGpuTick();
-    const auto search = [this, gpu_tick](std::size_t begin,
-                                         std::size_t end) -> std::optional<std::size_t> {
-        for (std::size_t iterator = begin; iterator < end; ++iterator) {
-            if (gpu_tick >= ticks[iterator]) {
-                ticks[iterator] = work_semaphore->CurrentTick();
-                return iterator;
-            }
-        }
-        return std::nullopt;
-    };
-
-    // Try to find a free resource from the hinted position to the end.
-    auto found = search(hint_iterator, ticks.size());
+    auto found = FindReusableGpuResource(ticks, hint_iterator, *work_semaphore,
+                                        Semaphore::DeferCounterRefresh());
     if (!found) {
-        // Refresh semaphore to query updated results
-        work_semaphore->Refresh();
-        gpu_tick = work_semaphore->KnownGpuTick();
-        found = search(hint_iterator, ticks.size());
+        // No proven-free resource: allocate instead of reusing pending work.
+        found = ManageOverflow();
     }
-    if (!found) {
-        // Search from beginning to the hinted position.
-        found = search(0, hint_iterator);
-        if (!found) {
-            // Both searches failed, the pool is full; handle it.
-            const std::size_t free_resource = ManageOverflow();
-
-            ticks[free_resource] = work_semaphore->CurrentTick();
-            found = free_resource;
-        }
-    }
+    ticks[*found] = work_semaphore->CurrentTick();
 
     // Free iterator is hinted to the resource after the one that's been commited.
     hint_iterator = (*found + 1) % ticks.size();

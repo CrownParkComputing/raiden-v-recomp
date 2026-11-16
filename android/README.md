@@ -149,10 +149,18 @@ app. See [driver settings and recovery](../docs/android-driver-selection.md).
 
 Defaults are serial draw recording (`TEMPEST_DRAW_PIPE=0`), preparation on the
 GPU thread (`TEMPEST_PREP_WORKERS=0`), FEX MaxInst 500, the shared 1080p render
-setting with 1280x720 host output, and on-demand shader compilation. Actual guest
-render-target dimensions remain to be verified. No per-title
+setting with 1280x720 host output, and on-demand shader compilation. Device
+captures show 1920x1080 guest display buffers and an 896x1024 scene color target;
+the host output size does not determine those guest targets. No per-title
 intro-skip override is inherited. `launch.ini` can override the shared settings;
 normal play has no diagnostic timeout.
+
+`TEMPEST_VK_DEFER_COUNTER_REFRESH=1` enables experimental on-demand GPU
+completion polling for a fresh process; its default is off. Completed ticks
+advance only after a successful wait/poll or a real counter query. The resource
+pool rereads the refreshed completion value before reusing an allocation.
+These synchronization changes have focused regressions; this option is not a
+claim of improved frame rate on every device.
 
 The latest executable's 80-byte procparam at guest offset `0x2d4000` supplies SDK
 `0x04508101` at offset +16; Android reads it from the prepared image. GPU setup

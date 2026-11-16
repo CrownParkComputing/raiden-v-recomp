@@ -849,6 +849,9 @@ public:
         if (work_semaphore.IsFree(tick)) {
             return true;
         }
+        if (Semaphore::DeferCounterRefresh()) {
+            return work_semaphore.Poll(tick);
+        }
         work_semaphore.Refresh();
         return work_semaphore.IsFree(tick);
     }

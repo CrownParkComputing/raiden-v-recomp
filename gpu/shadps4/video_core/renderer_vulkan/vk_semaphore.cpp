@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <limits>
+#include "video_core/renderer_vulkan/vk_gpu_tick_cache.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_semaphore.h"
 
@@ -28,6 +30,14 @@ Semaphore::Semaphore(const Instance& instance_) : instance{instance_} {
 
 Semaphore::~Semaphore() = default;
 
+bool Semaphore::DeferCounterRefresh() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("TEMPEST_VK_DEFER_COUNTER_REFRESH");
+        return value && value[0] == '1' && value[1] == '\0';
+    }();
+    return enabled;
+}
+
 void Semaphore::Refresh() {
     u64 this_tick{};
     u64 counter{};
@@ -44,15 +54,33 @@ void Semaphore::Refresh() {
                                              std::memory_order_relaxed));
 }
 
+bool Semaphore::Poll(u64 tick) {
+    return PollGpuTick(gpu_tick, tick, [this](u64 required_tick) {
+        const vk::SemaphoreWaitInfo wait_info = {
+            .semaphoreCount = 1,
+            .pSemaphores = &semaphore.get(),
+            .pValues = &required_tick,
+        };
+        const auto result = instance.GetDevice().waitSemaphores(&wait_info, 0);
+        ASSERT_MSG(result == vk::Result::eSuccess || result == vk::Result::eTimeout,
+                   "Polling GPU tick {} failed: {}{}", required_tick, vk::to_string(result),
+                   result == vk::Result::eErrorDeviceLost ? " (the GPU was reset after a hang)" : "");
+        return result == vk::Result::eSuccess;
+    });
+}
+
 void Semaphore::Wait(u64 tick) {
     // No need to wait if the GPU is ahead of the tick
     if (IsFree(tick)) {
         return;
     }
-    // Update the GPU tick and try again
-    Refresh();
-    if (IsFree(tick)) {
-        return;
+    const bool defer_counter_refresh = DeferCounterRefresh();
+    if (!defer_counter_refresh) {
+        // Update the GPU tick and try again.
+        Refresh();
+        if (IsFree(tick)) {
+            return;
+        }
     }
 
     // If none of the above is hit, fallback to a regular wait
@@ -72,7 +100,11 @@ void Semaphore::Wait(u64 tick) {
     ASSERT_MSG(result == vk::Result::eSuccess, "Waiting for GPU tick {} failed: {}{}", tick,
                vk::to_string(result),
                result == vk::Result::eErrorDeviceLost ? " (the GPU was reset after a hang)" : "");
-    Refresh();
+    if (defer_counter_refresh) {
+        PublishWaitedGpuTick(gpu_tick, tick, result == vk::Result::eSuccess);
+    } else {
+        Refresh();
+    }
 }
 
 } // namespace Vulkan

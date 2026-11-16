@@ -379,7 +379,11 @@ void Scheduler::PopPendingOperations() {
         if ((++pending_polls & 31) != 0 && !TempestToggle::Disabled(TempestToggle::PendingPollLimit)) {
             return;
         }
-        work_semaphore.Refresh();
+        if (Semaphore::DeferCounterRefresh()) {
+            (void)work_semaphore.Poll(pending_ops.front().gpu_tick);
+        } else {
+            work_semaphore.Refresh();
+        }
     }
     while (!pending_ops.empty() && work_semaphore.IsFree(pending_ops.front().gpu_tick)) {
         pending_ops.front().callback();
@@ -465,7 +469,10 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     auto submit_result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
     ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
 
-    work_semaphore.Refresh();
+    // Query completion on demand: submission itself does not prove completion.
+    if (!Semaphore::DeferCounterRefresh()) {
+        work_semaphore.Refresh();
+    }
     AllocateWorkerCommandBuffers();
 
     // Apply pending operations

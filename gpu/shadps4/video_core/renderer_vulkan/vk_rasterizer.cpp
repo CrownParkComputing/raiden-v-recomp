@@ -1059,12 +1059,18 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     if (FrameCapture::Active()) {
         const auto* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
         const std::string detail =
-            std::format(" | prim {} point-size-export {} point-control {:x} ps-input0 {:x} blend {} z {}{} cull {} mask {:x}{}",
+            std::format(" | prim {} point-size-export {} point-control {:x} ps-input0 {:x} blend {} z {}{} cull {} mask {:x}"
+                        " | db-alpha-to-mask[0xa2dc] {:08x} db-shader-control[0xa203] {:08x} db-eqaa[0xa201] {:08x}"
+                        " shader-alpha-mask-disable {} shader-coverage-to-mask {} shader-mask-export {}{}",
                         u32(regs.primitive_type), u32(regs.vs_output_control.use_vtx_point_size),
                         regs.reg_array[0xA1B5],
                         std::bit_cast<u32>(regs.ps_inputs[0]), u32(regs.blend_control[0].enable),
                         u32(regs.depth_control.depth_enable), u32(regs.depth_control.depth_write_enable),
                         u32(regs.polygon_control.CullingMode()), u32(regs.color_target_mask.raw),
+                        regs.reg_array[0xA2DC], regs.reg_array[0xA203], regs.reg_array[0xA201],
+                        u32(regs.depth_shader_control.alpha_to_mask_disable),
+                        u32(regs.depth_shader_control.coverage_to_mask_enable),
+                        u32(regs.depth_shader_control.mask_export_enable),
                         capture_vertices);
         capture_vertices.clear();
         FrameCapture::Draw(vs_info.pgm_hash, ps ? ps->pgm_hash : 0, num_indices, num_instances,

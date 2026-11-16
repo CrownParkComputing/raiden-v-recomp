@@ -61,16 +61,33 @@ native calls and FEX callback-dispatch fixtures. Python checks pass 92 tests
 with 17 optional skips, and driver ZIP fixtures pass.
 Android has a separate app identity, the shared L3+R3 settings panel and the
 bundled/system/imported driver choices. Android main, boot-check and FEX-check targets build. The signed version
-0.1/code 1 APK passes identity, ARM64/API, original-icon and bundled-driver
+0.3/code 3 APK passes identity, ARM64/API, original-icon and bundled-driver
 provenance checks. It is installed on the Retroid and its installed hash matches
-the build. The SD-card game-data transfer was interrupted by a lost device
-connection; completing staging and checking device gameplay, graphics, audio
-and performance remain pending. The existing foreground app was left running.
+the build. The interrupted SD transfer initially left required boot assets absent.
+After resuming, all 2,657 files and their sizes matched the host, along with
+five critical file hashes. The Retroid Pocket Flip2 now reaches Stage 1 with
+music and save-memory writes. Stage 1 currently measures about 31–32 FPS,
+compared with about 50–55 FPS in menus; Android performance work remains open.
+The reported cloud streaks are under investigation. This is an initial stage
+check, not a complete playthrough.
+
+The shared FEX wait wrapper now returns a permitted spurious wake after an
+artificial 10 ms condition-wait slice, allowing the guest to recheck its
+predicate. Real deadlines still report timeout. A bounded single-notification
+regression fails on the previous FEX wrapper and passes after this correction.
+Native/FEX deadline and recursive-lock checks and sanitizer runs pass.
+
+GPU resource reuse now observes completion refreshed during its search rather
+than a captured older tick. Optional deferred counter polling remains disabled
+by default. Focused tests cover concurrent completion, timeout, ordered
+retirement and real pool selection; native and Android builds pass. Frame
+capture also records raw alpha-mask state for the cloud investigation.
 
 The source was published at commit
 `5d8cbe63da8c709af3a634801e40d9846d32347b` and the fresh Ubuntu
 [CI build and runtime/Python/driver checks passed](https://github.com/CrownParkComputing/raiden-v-recomp/actions/runs/43778487064).
-Later documentation-only updates do not change that tested runtime.
+The subsequent wait and GPU-polling changes have focused local verification;
+the earlier CI result describes its linked commit.
 
 Private evidence is retained under `out/` and in the CUSA07673 input review
 directory. No game assets, packages or drivers belong in the public source.

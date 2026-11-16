@@ -115,11 +115,15 @@ static void test_absolute_deadline(void) {
     GuestMutex *mutex=NULL; GuestCond *cond=NULL;
     assert(posix_mutex_init(&mutex,NULL)==0);
     assert(posix_cond_init(&cond,NULL)==0 && posix_mutex_lock(&mutex)==0);
-    GuestTimespec until=deadline_ms(40);
     uint64_t before=monotonic_ns();
-    assert(posix_cond_timedwait(&cond,&mutex,&until)==60);
+    GuestTimespec until=deadline_ms(40);
+    int result;
+    do {
+        result=posix_cond_timedwait(&cond,&mutex,&until);
+    } while (!result && monotonic_ns()-before<UINT64_C(2000000000));
+    assert(result==60); /* Spurious wakes recheck the same absolute deadline. */
     uint64_t elapsed=monotonic_ns()-before;
-    assert(elapsed>=UINT64_C(1000000) && elapsed<UINT64_C(2000000000));
+    assert(elapsed>=UINT64_C(30000000) && elapsed<UINT64_C(2000000000));
     assert(posix_mutex_trylock(&mutex)==16); /* timed wait returned with the lock reacquired */
     assert(posix_mutex_destroy(&mutex)==16);
     until=(GuestTimespec){0,0};
@@ -134,7 +138,6 @@ static void test_absolute_deadline(void) {
     assert(posix_mutex_destroy(&mutex)==0 && posix_cond_destroy(&cond)==0);
     assert(posix_condattr_init(NULL)==22 && posix_cond_init(NULL,NULL)==22);
 }
-#ifdef TEMPEST_FEX
 static void pause_ms(unsigned ms) {
     struct timespec pause={ms/1000,(long)(ms%1000)*1000000};
     while (nanosleep(&pause,&pause)) assert(errno==EINTR);
@@ -144,6 +147,52 @@ static int await_flag(atomic_int *flag,unsigned ms) {
     while (!atomic_load(flag) && monotonic_ns()<limit) pause_ms(1);
     return atomic_load(flag);
 }
+typedef struct {
+    GuestMutex *mutex;
+    GuestCond *cond;
+    atomic_int entered,done;
+    int ready,timed,result;
+} SliceNotification;
+static void *wait_across_slice(void *argument) {
+    SliceNotification *s=argument;
+    GuestTimespec until=deadline_ms(1000);
+    assert(posix_mutex_lock(&s->mutex)==0);
+    atomic_store(&s->entered,1);
+    while (!s->ready) {
+        s->result=s->timed ? posix_cond_timedwait(&s->cond,&s->mutex,&until)
+                           : posix_cond_wait(&s->cond,&s->mutex);
+        if (s->result) break;
+    }
+    assert(posix_mutex_unlock(&s->mutex)==0);
+    atomic_store(&s->done,1);
+    return NULL;
+}
+static void test_condition_slice_notification(int timed) {
+    SliceNotification s={.timed=timed}; pthread_t thread;
+    assert(posix_mutex_init(&s.mutex,NULL)==0 && posix_cond_init(&s.cond,NULL)==0);
+    assert(pthread_create(&thread,NULL,wait_across_slice,&s)==0);
+    assert(await_flag(&s.entered,500));
+    /* Acquiring it proves the waiter released it inside the condition wait. Keep it
+     * past the artificial10ms timeout, so the waiter must reacquire it after expiration. */
+    assert(posix_mutex_lock(&s.mutex)==0);
+    pause_ms(30);
+    s.ready=1;
+    assert(posix_cond_signal(&s.cond)==0);
+    assert(posix_mutex_unlock(&s.mutex)==0);
+    int first_notification_delivered=await_flag(&s.done,100);
+    /* Rescue an old waiter before checking the regression, so failure is a bounded assertion
+     * after cleanup rather than an indefinitely parked test process. */
+    for (unsigned i=0;!atomic_load(&s.done) && i<20;++i) {
+        assert(posix_mutex_lock(&s.mutex)==0);
+        assert(posix_cond_broadcast(&s.cond)==0);
+        assert(posix_mutex_unlock(&s.mutex)==0);
+        pause_ms(5);
+    }
+    assert(atomic_load(&s.done) && pthread_join(thread,NULL)==0);
+    assert(posix_mutex_destroy(&s.mutex)==0 && posix_cond_destroy(&s.cond)==0);
+    assert(first_notification_delivered && s.result==0);
+}
+#ifdef TEMPEST_FEX
 typedef struct {
     GuestMutex *mutex;
     atomic_int callback_started,callback_release,callback_done,done;
@@ -260,6 +309,8 @@ int main(void) {
     test_condition_wakeup(1);
     test_condition_wakeup(2);
     test_absolute_deadline();
+    test_condition_slice_notification(0);
+    test_condition_slice_notification(1);
 #ifdef TEMPEST_FEX
     test_exception_checkpoint();
     for (int protocol=0;protocol<=1;++protocol) {

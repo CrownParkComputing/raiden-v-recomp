@@ -274,6 +274,12 @@ static int cond_wait_checkpoint(GuestCond *cond,GuestMutex *mutex,const struct t
         }
         if (error!=ETIMEDOUT) break;
         if (deadline && compare_time(&slice,deadline)>=0) break;
+        /* An artificial timeout unregisters the host waiter before mutex reacquisition.
+         * A signaler may have changed the predicate and signalled while holding that mutex
+         * across the slice deadline. Do not hide this timeout and wait again: return a
+         * permitted spurious wake so the guest checks its predicate before reenrolling. */
+        error=0;
+        break;
     }
     for (unsigned i=1;i<depth;++i) {
         int lock_error=pthread_mutex_lock(&mutex->native);
