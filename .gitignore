@@ -1,0 +1,30 @@
+/.vscode
+__pycache__/
+/.claude/
+/.copilot/
+out/
+user/
+/*.ini
+!/settings.example.ini
+*.orig
+/*.spv
+dist/
+dist-*/
+
+# Locally supplied Android driver archives and signing material.
+/*.zip
+*.apk
+*.keystore
+*.jks
+
+# Private original game dumps.
+game/
+/input/
+*.pkg
+*.rar
+
+/res/polybius-android-icon.png
+
+/res/raiden-fighters-android-icon.png
+
+/res/raiden-v-android-icon.png

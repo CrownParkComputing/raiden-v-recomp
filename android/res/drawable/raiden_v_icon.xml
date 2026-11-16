@@ -1,0 +1,9 @@
+<!-- Project-owned fallback artwork; local packaging may replace it with the dump's icon. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp"
+    android:viewportWidth="108" android:viewportHeight="108">
+    <path android:fillColor="#102034" android:pathData="M0,0H108V108H0Z" />
+    <path android:fillColor="#41D9EF" android:pathData="M54,12L62,42L94,69L65,63L61,84H47L43,63L14,69L46,42Z" />
+    <path android:fillColor="#EAFBFF" android:pathData="M54,20L59,48L54,61L49,48Z" />
+    <path android:fillColor="#FF9A32" android:pathData="M49,87H59L54,101Z" />
+</vector>

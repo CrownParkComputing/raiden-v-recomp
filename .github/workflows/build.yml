@@ -1,0 +1,48 @@
+name: Linux source build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    env:
+      SDL_AUDIO_DRIVER: dummy
+      CC: clang-18
+      CXX: clang++-18
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependencies
+        run: bash .github/scripts/ci-deps.sh
+      - name: Build and runtime checks
+        timeout-minutes: 60
+        run: bash build.sh --test
+      - name: Python checks
+        run: cd tests && python3 -m unittest discover -p 'test_*.py'
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Driver ZIP regression
+        run: bash tools/check_android_driver_import.sh
+      - name: Test logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-test-logs
+          path: |
+            out/gpu-build.log
+            out/*-test.log
+
+# Game files, prepared images, driver ZIPs and signing keys stay local.
+# This workflow does not publish the inherited Tempest binary packages.

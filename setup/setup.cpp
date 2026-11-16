@@ -1,0 +1,654 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+#include "setup.h"
+
+#include <fcntl.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <cerrno>
+#include <cstdlib>
+
+#include <cwctype>
+#include <fstream>
+#include <iterator>
+#include <string_view>
+#include <vector>
+
+namespace fs = std::filesystem;
+
+namespace setup {
+
+namespace {
+// For an eboot.bin that is not a verified build (scripts/prepare.py VERIFIED_BUILDS).
+constexpr wchar_t kUnverifiedWarning[] =
+    L"This dump's eboot.bin is not the version this release was tested with (the unmodified eboot.bin "
+    L"of Tempest CUSA00038, update 1.10). Patched files, such as DLC unlockers, and other versions are "
+    L"untested: the game may be unstable or crash.\n\nAll add-ons already show as owned without an "
+    L"unlocker.";
+
+// What run.py reads from the dump to prepare the image (IMAGE_INPUTS), and the title's param.sfo.
+constexpr const wchar_t* kGameFiles[] = {
+    L"eboot.bin",
+    L"sce_sys/param.sfo",
+    L"sce_module/libc.prx",
+    L"sce_module/libSceFios2.prx",
+};
+constexpr wchar_t kIncomplete[] = L"\n\nThis folder is incomplete: unpack the whole release again.";
+constexpr wchar_t kSeparator[] = L"/";
+constexpr char kNewline[] = "\n";
+
+[[noreturn]] void fail(std::wstring message) {
+    throw Error{std::move(message)};
+}
+
+// Absolute and normalized, without a trailing separator.
+fs::path clean(const fs::path& p) {
+    std::error_code ec;
+    fs::path a = fs::absolute(p, ec).lexically_normal();
+    while (!a.has_filename() && a.has_relative_path())
+        a = a.parent_path();
+    return a;
+}
+
+// Windows paths are case-insensitive; Linux paths are not.
+std::wstring lower(std::wstring s) {
+    return s;
+}
+
+// `inner` is `outer` or a folder inside it.
+bool inside(const fs::path& inner, const fs::path& outer) {
+    std::wstring i = lower(text(clean(inner))), o = lower(text(clean(outer)));
+    return i == o || i.rfind(o + kSeparator, 0) == 0;
+}
+
+std::wstring join(const std::vector<std::wstring>& items) {
+    std::wstring s;
+    for (const std::wstring& item : items)
+        s += (s.empty() ? L"" : L", ") + item;
+    return s;
+}
+
+std::string read_text(const fs::path& p) {
+    std::ifstream f(p, std::ios::binary);
+    if (!f)
+        fail(L"cannot read " + text(p));
+    return {std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>()};
+}
+
+void write_text(const fs::path& p, const std::string& text) {
+    std::ofstream f(p, std::ios::binary | std::ios::trunc);
+    f.write(text.data(), static_cast<std::streamsize>(text.size()));
+    if (!f)
+        fail(L"cannot write " + setup::text(p) + L"\nIf the game is running, close it and try again.");
+}
+
+// --- child processes ----------------------------------------------------------------------------
+
+// Passes each line of a child's output to `log` (and `output`, if given).
+class LineSink {
+public:
+    LineSink(const Log& log, std::wstring* output) : log_(log), output_(output) {}
+    void add(const char* bytes, size_t n) {
+        pending_.append(bytes, n);
+        for (size_t end; (end = pending_.find('\n')) != std::string::npos; pending_.erase(0, end + 1))
+            emit(std::string_view(pending_).substr(0, end));
+    }
+    void finish() {
+        if (!pending_.empty())
+            emit(pending_);
+    }
+
+private:
+    void emit(std::string_view bytes) {
+        std::wstring line = widen(bytes);
+        while (!line.empty() && line.back() == L'\r')
+            line.pop_back();
+        log_(L"  " + line);
+        if (output_)
+            *output_ += line + L"\n";
+    }
+    const Log& log_;
+    std::wstring* output_;
+    std::string pending_;
+};
+
+// Runs `args` in `cwd` and passes each line it prints to `log`. Returns the exit code (128 + the
+// signal when it was killed); `output` (if given) collects the text.
+unsigned long run(const std::vector<std::wstring>& args, const fs::path& cwd, const Log& log, std::wstring* output = nullptr) {
+    std::vector<std::string> narrow_args;
+    for (const std::wstring& a : args)
+        narrow_args.push_back(narrow(a));
+    std::vector<char*> argv;
+    for (std::string& a : narrow_args)
+        argv.push_back(a.data());
+    argv.push_back(nullptr);
+    int fds[2];
+    if (pipe2(fds, O_CLOEXEC))
+        fail(L"cannot start " + args[0]);
+    pid_t pid = fork();
+    if (pid == 0) {
+        dup2(fds[1], STDOUT_FILENO);
+        dup2(fds[1], STDERR_FILENO);
+        if (!chdir(cwd.c_str()))
+            execvp(argv[0], argv.data());
+        _exit(127);
+    }
+    close(fds[1]);
+    if (pid < 0) {
+        close(fds[0]);
+        fail(L"cannot start " + args[0]);
+    }
+    LineSink sink(log, output);
+    char buf[4096];
+    for (ssize_t n; (n = read(fds[0], buf, sizeof(buf))) != 0;) {
+        if (n > 0)
+            sink.add(buf, static_cast<size_t>(n));
+        else if (errno != EINTR)
+            break;
+    }
+    sink.finish();
+    close(fds[0]);
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+    }
+    return WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
+}
+
+fs::path search_path(const char* name) {
+    const char* path = std::getenv("PATH");
+    std::string_view dirs = path ? path : "/usr/local/bin:/usr/bin:/bin";
+    while (!dirs.empty()) {
+        size_t colon = dirs.find(':');
+        std::string_view dir = dirs.substr(0, colon);
+        dirs = colon == std::string_view::npos ? std::string_view() : dirs.substr(colon + 1);
+        fs::path candidate = fs::path(std::string(dir.empty() ? "." : dir)) / name;
+        if (!access(candidate.c_str(), X_OK))
+            return candidate;
+    }
+    return {};
+}
+
+// The Python that runs prepare/run.py: the release's own (prepare/python/bin/python3) if it has one,
+// else the system's python3.
+std::vector<std::wstring> python_command(const fs::path& prepare) {
+    std::error_code ec;
+    if (fs::path own = prepare / "python" / "bin" / "python3"; fs::is_regular_file(own, ec))
+        return {text(own)};
+    for (const char* name : {"python3", "python"})
+        if (fs::path python = search_path(name); !python.empty())
+            return {text(python)};
+    fail(L"Setup needs Python 3.10 or newer to prepare the game. Install python3 with your distribution's "
+         L"package manager, then run setup again.");
+}
+
+// --- paths.ini ----------------------------------------------------------------------------------
+
+std::wstring strip(const std::wstring& s) {
+    constexpr wchar_t ws[] = L" \t\r\n\"";
+    size_t a = s.find_first_not_of(ws);
+    if (a == std::wstring::npos)
+        return {};
+    return s.substr(a, s.find_last_not_of(ws) - a + 1);
+}
+
+void write_paths(const fs::path& ini, const fs::path& game, const fs::path& save, const fs::path& dlc) {
+    const std::string setup = "tempest-setup", cache = "~/.cache/tempest";
+    const std::string nl = kNewline;
+    write_text(ini, "; Written by " + setup + ". Run it again to change these folders." + nl +
+                    "; game: your dump (eboot.bin, sce_module, sce_sys, stream.dat). It is only ever read." + nl +
+                    "; save: your saves, and tempest.log in its log folder." + nl +
+                    "; dlc: optional, one more folder of DLC (e.g. shadPS4's addcont), next to save's addcont." + nl +
+                    "; Shader caches are in the shaders folder next to " + setup + "." + nl +
+                    "; The GPU logs and screenshots are shared by every copy of the game: " + cache + nl +
+                    "; (cache=<folder> moves them)." + nl +
+                    "[paths]" + nl +
+                    "game=" + narrow(text(game)) + nl +
+                    "save=" + narrow(text(save)) + nl +
+                    (dlc.empty() ? std::string() : "dlc=" + narrow(text(dlc)) + nl));
+}
+
+// The key of a settings.ini line ("key=value", gpu/shim/tempest_settings.cpp), lower case; empty
+// for comments and other lines.
+std::wstring setting_key(std::string_view line) {
+    size_t eq = line.find('=');
+    std::wstring key = eq == std::string_view::npos ? std::wstring() : lower(strip(widen(line.substr(0, eq))));
+    return !key.empty() && key[0] != L'#' && key[0] != L';' ? key : std::wstring();
+}
+
+// `key`'s value in a settings.ini: the last line that sets it wins, as in the game.
+std::optional<std::wstring> read_setting(const fs::path& ini, const std::wstring& key) {
+    std::error_code ec;
+    if (!fs::is_regular_file(ini, ec))
+        return std::nullopt;
+    std::string text = read_text(ini);
+    std::optional<std::wstring> value;
+    for (size_t start = 0; start < text.size();) {
+        size_t end = text.find('\n', start);
+        std::string_view line = std::string_view(text).substr(start, end == std::string::npos ? end : end - start);
+        start = end == std::string::npos ? text.size() : end + 1;
+        if (setting_key(line) == key)
+            value = strip(widen(line.substr(line.find('=') + 1)));
+    }
+    return value;
+}
+
+// Sets `key` in a settings.ini: its first line is replaced and any later ones dropped, or the line is
+// added at the end. The other lines and their line endings stay.
+void write_setting(const fs::path& ini, const std::wstring& key, const std::wstring& value) {
+    std::string text = read_text(ini), out, line_text = narrow(key) + "=" + narrow(value);
+    bool done = false;
+    for (size_t start = 0; start < text.size();) {
+        size_t end = text.find('\n', start);
+        std::string_view line = std::string_view(text).substr(start, end == std::string::npos ? end : end - start);
+        start = end == std::string::npos ? text.size() : end + 1;
+        bool cr = !line.empty() && line.back() == '\r';
+        if (setting_key(line) == key) {
+            if (done)
+                continue;
+            out += line_text + (cr ? "\r" : "");
+            done = true;
+        } else {
+            out += line;
+        }
+        if (end != std::string::npos)
+            out += '\n';
+    }
+    if (!done) {
+        if (!out.empty() && out.back() != '\n')
+            out += kNewline;
+        out += line_text + kNewline;
+    }
+    write_text(ini, out);
+}
+
+// A desktop entry's quoted argument: ", `, $ and \ escaped inside the quotes, \ doubled again for
+// the string value itself, and % doubled (field codes).
+std::string desktop_quote(const std::string& arg) {
+    std::string q = "\"";
+    for (char c : arg) {
+        if (c == '\\')
+            q += "\\\\\\\\";
+        else if (c == '"' || c == '`' || c == '$')
+            q += std::string("\\") + c;
+        else if (c == '%')
+            q += "%%";
+        else
+            q += c;
+    }
+    return q + "\"";
+}
+
+// $HOME, or the current folder when it is unset.
+fs::path home() {
+    const char* h = std::getenv("HOME");
+    return h && h[0] ? fs::path(h) : fs::current_path();
+}
+
+} // namespace
+
+// UTF-8 to UTF-32 (wchar_t); a malformed byte becomes U+FFFD.
+std::wstring widen(std::string_view s) {
+    std::wstring w;
+    for (size_t i = 0; i < s.size();) {
+        unsigned char c = static_cast<unsigned char>(s[i]);
+        int extra = c < 0x80 ? 0 : (c & 0xE0) == 0xC0 ? 1 : (c & 0xF0) == 0xE0 ? 2 : (c & 0xF8) == 0xF0 ? 3 : -1;
+        char32_t code = extra == 0 ? c : extra == 1 ? c & 0x1F : extra == 2 ? c & 0x0F : c & 0x07;
+        bool ok = extra >= 0 && i + static_cast<size_t>(extra) < s.size();
+        for (int k = 1; ok && k <= extra; ++k) {
+            unsigned char next = static_cast<unsigned char>(s[i + static_cast<size_t>(k)]);
+            ok = (next & 0xC0) == 0x80;
+            code = (code << 6) | (next & 0x3F);
+        }
+        if (!ok) {
+            w += L'�';
+            ++i;
+            continue;
+        }
+        w += static_cast<wchar_t>(code);
+        i += static_cast<size_t>(extra) + 1;
+    }
+    return w;
+}
+
+std::string narrow(std::wstring_view s) {
+    std::string u;
+    for (wchar_t wc : s) {
+        auto c = static_cast<char32_t>(wc);
+        if (c < 0x80) {
+            u += static_cast<char>(c);
+        } else if (c < 0x800) {
+            u += static_cast<char>(0xC0 | (c >> 6));
+            u += static_cast<char>(0x80 | (c & 0x3F));
+        } else if (c < 0x10000) {
+            u += static_cast<char>(0xE0 | (c >> 12));
+            u += static_cast<char>(0x80 | ((c >> 6) & 0x3F));
+            u += static_cast<char>(0x80 | (c & 0x3F));
+        } else {
+            u += static_cast<char>(0xF0 | (c >> 18));
+            u += static_cast<char>(0x80 | ((c >> 12) & 0x3F));
+            u += static_cast<char>(0x80 | ((c >> 6) & 0x3F));
+            u += static_cast<char>(0x80 | (c & 0x3F));
+        }
+    }
+    return u;
+}
+
+std::wstring text(const fs::path& p) {
+    return widen(p.native());
+}
+
+fs::path path_of(const std::wstring& s) {
+    return fs::path(narrow(s));
+}
+
+fs::path exe_folder() {
+    std::error_code ec;
+    fs::path exe = fs::read_symlink("/proc/self/exe", ec);
+    return ec ? fs::current_path() : exe.parent_path();
+}
+
+bool same_path(const fs::path& a, const fs::path& b) {
+    return lower(text(clean(a))) == lower(text(clean(b)));
+}
+
+fs::path game_folder(const fs::path& path) {
+    std::error_code ec;
+    fs::path p = clean(path);
+    return fs::is_regular_file(p, ec) ? p.parent_path() : p;
+}
+
+bool is_pkg(const fs::path& path) {
+    return lower(path.extension().wstring()) == L".pkg";
+}
+
+fs::path pkg_folder(const fs::path& pkg) {
+    return clean(pkg.parent_path() / pkg.stem());
+}
+
+std::vector<std::wstring> missing_game_files(const fs::path& game) {
+    std::error_code ec;
+    fs::path folder = game_folder(game);
+    std::vector<std::wstring> missing;
+    for (const wchar_t* f : kGameFiles)
+        if (!fs::is_regular_file(folder / f, ec))
+            missing.push_back(text(fs::path(f).make_preferred()));
+    return missing;
+}
+
+fs::path user_paths_ini() {
+    const char* config = std::getenv("XDG_CONFIG_HOME");
+    return (config && config[0] ? fs::path(config) : home() / ".config") / "tempest" / "paths.ini";
+}
+
+namespace {
+
+// game=, save= and dlc= of `ini`; relative values are relative to `root`.
+std::optional<Paths> read_paths_file(const fs::path& ini, const fs::path& root) {
+    std::error_code ec;
+    if (ini.empty() || !fs::is_regular_file(ini, ec))
+        return std::nullopt;
+    std::string text = read_text(ini);
+    if (text.rfind("\xEF\xBB\xBF", 0) == 0)
+        text.erase(0, 3);
+    Paths paths;
+    for (size_t start = 0; start < text.size();) {
+        size_t end = text.find('\n', start);
+        std::wstring line = widen(std::string_view(text).substr(start, end == std::string::npos ? end : end - start));
+        start = end == std::string::npos ? text.size() : end + 1;
+        size_t eq = line.find(L'=');
+        std::wstring key = lower(strip(line.substr(0, eq)));
+        if (eq == std::wstring::npos || key.empty() || key[0] == L';' || key[0] == L'#')
+            continue;
+        std::wstring value = strip(line.substr(eq + 1));
+        if (value.empty())
+            continue;
+        if (key == L"game")
+            paths.game = clean(root / path_of(value));
+        else if (key == L"save")
+            paths.save = clean(root / path_of(value));
+        else if (key == L"dlc")
+            paths.dlc = clean(root / path_of(value));
+    }
+    if (paths.game.empty() || paths.save.empty())
+        return std::nullopt;
+    return paths;
+}
+
+} // namespace
+
+std::optional<Paths> read_paths(const fs::path& root) {
+    return read_paths_file(root / L"paths.ini", root);
+}
+
+std::optional<Paths> remembered_paths(const fs::path& root) {
+    if (auto paths = read_paths(root))
+        return paths;
+    try {
+        return read_paths_file(user_paths_ini(), root);
+    } catch (const Error&) {
+        return std::nullopt;
+    }
+}
+
+fs::path default_save() {
+    return exe_folder() / L"save";
+}
+
+bool ready(const fs::path& root) {
+    std::error_code ec;
+    fs::path stamp = root / L"game" / L"release.txt", release = root / L"release.txt";
+    try {
+        return read_paths(root) && fs::is_regular_file(root / kGameExe, ec) && fs::is_regular_file(stamp, ec) &&
+               fs::is_regular_file(release, ec) && read_text(stamp) == read_text(release);
+    } catch (const Error&) {
+        return false;
+    }
+}
+
+bool skip_intro(const fs::path& root, const fs::path& save) {
+    std::error_code ec;
+    fs::path ini = save / L"settings.ini";
+    if (!fs::is_regular_file(ini, ec))
+        ini = root / L"settings.ini";
+    try {
+        std::optional<std::wstring> value = read_setting(ini, L"skip_intro");
+        if (!value) return true; // the default: skip
+        std::wstring v = lower(*value);
+        return v == L"1" || v == L"true" || v == L"yes" || v == L"on";
+    } catch (const Error&) {
+        return true;
+    }
+}
+
+bool has_saves(const fs::path& save) {
+    std::error_code ec;
+    fs::path data = save / L"savedata";
+    return fs::is_directory(data, ec) && !fs::is_empty(data, ec);
+}
+
+fs::path install(const Options& opt, const Log& log) {
+    fs::path root = clean(opt.root), save = clean(opt.save);
+    fs::path dlc = opt.dlc.empty() ? fs::path() : clean(opt.dlc);
+    fs::path prepare = root / L"prepare", image = root / L"game", exe = root / kGameExe;
+    auto step = [&](double done, const std::wstring& what) {
+        if (opt.progress)
+            opt.progress(done, what);
+    };
+    step(0.0, L"Checking your dump");
+    // A .pkg instead of a dump: it is extracted into a folder next to it, and that folder is the dump.
+    fs::path pkg = is_pkg(opt.game) ? clean(opt.game) : fs::path();
+    fs::path game = pkg.empty() ? game_folder(opt.game) : pkg_folder(pkg);
+    if (inside(save, game))
+        fail(L"Choose a save folder outside the game folder. Setup never writes into the game folder.");
+    if (inside(root, game) || inside(game, root))
+        fail(L"Keep the game folder and this folder apart (neither inside the other).");
+    std::error_code dlc_ec;
+    if (!dlc.empty() && !fs::is_directory(dlc, dlc_ec))
+        fail(L"The DLC folder does not exist:\n" + text(dlc) + L"\n\nChoose another one, or leave it empty.");
+    if (!dlc.empty() && same_path(dlc, save / L"addcont"))
+        dlc.clear(); // the save folder's addcont is always read
+
+    std::error_code ec;
+    for (const fs::path& f : {exe, prepare / L"run.py", root / L"release.txt"})
+        if (!fs::is_regular_file(f, ec))
+            fail(text(f) + L" is missing." + kIncomplete);
+    std::vector<std::wstring> python = python_command(prepare);
+
+    if (!pkg.empty()) {
+        step(0.02, L"Extracting your .pkg");
+        log(L"Extracting " + text(pkg) + L" into " + text(game));
+        // The extractor decrypts the game data with the setup program (--xts-tool), which is the
+        // only part of it that is not slow enough to do in Python.
+        std::vector<std::wstring> extract = python;
+        extract.insert(extract.end(), {text(prepare / L"scripts" / L"pkg_extract.py"), text(pkg),
+                                       L"--out", text(game), L"--xts-tool",
+                                       text(exe_folder() / kSetupExe)});
+        if (run(extract, prepare, log))
+            fail(L"Extracting the .pkg failed. The log says why.");
+    }
+
+    std::vector<std::wstring> missing = missing_game_files(game);
+    if (!missing.empty())
+        fail(L"This folder isn't a decrypted Tempest dump:\n" + text(game) +
+             L"\n\nMissing: " + join(missing));
+
+    step(0.05, L"Preparing the game from your dump");
+    log(L"Preparing the game from " + text(game));
+    fs::remove(image / L"release.txt", ec); // the image is this release's only once it is complete
+    std::vector<std::wstring> command = python;
+    command.insert(command.end(), {text(prepare / L"run.py"), L"prepare", L"--game", text(game),
+                                   L"--out", text(image)});
+    setenv("PYTHONIOENCODING", "utf-8", 1);
+    // Exit code 3: eboot.bin is not one of the builds scripts/prepare.py lists as verified, and nothing
+    // was prepared. The player is warned, and on going on it is prepared anyway (--any-build).
+    unsigned long code = run(command, prepare, log);
+    if (code == 3) {
+        log(L"warning: " + std::wstring(kUnverifiedWarning));
+        if (opt.confirm && !opt.confirm(std::wstring(kUnverifiedWarning) + L"\n\nContinue anyway?"))
+            fail(L"Setup stopped: the game was not prepared.");
+        command.push_back(L"--any-build");
+        code = run(command, prepare, log);
+    }
+    if (code)
+        fail(L"Preparing the game failed (exit code " + std::to_wstring(code) + L"). The log says why.");
+
+    // On a CPU without some instruction sets the game uses, the sites that use them are rewritten
+    // (run.py's play does this at every start; here once).
+    step(0.75, L"Checking this PC's CPU");
+    std::wstring cpu;
+    code = run({text(exe), L"--cpu-features"}, root, log, &cpu);
+    if (code == 20)
+        fail(L"This PC's CPU cannot run the game:\n" + cpu);
+    if (code)
+        fail(L"The game does not start (exit code " + std::to_wstring(code) + L")." + kIncomplete);
+    if (cpu.find(L"CPU: missing") != std::wstring::npos) {
+        step(0.8, L"Rewriting instructions this CPU lacks");
+        command = python;
+        command.insert(command.end(), {text(prepare / L"scripts" / L"isa_rewrite.py"),
+                                       text(image / L"boot-linked.bin"), L"--out", text(image)});
+        if (run(command, prepare, log))
+            fail(L"This CPU lacks instructions the game uses, and rewriting them failed. That step needs the "
+                 L"Python package iced-x86 (pip install iced-x86); the log says more.");
+    } else {
+        fs::remove(image / L"isa-rewrite.bin", ec);
+    }
+    write_text(image / L"release.txt", read_text(root / L"release.txt"));
+    log(L"prepared " + text(image));
+    step(0.9, L"Writing settings and folders");
+
+    fs::path settings = root / L"settings.ini";
+    if (!fs::exists(settings, ec)) {
+        if (!fs::copy_file(prepare / L"settings.example.ini", settings, ec))
+            fail(L"cannot write " + text(settings));
+        log(L"wrote    settings.ini");
+    }
+
+    // The shader cache (src/launcher.c points the game at it).
+    fs::create_directories(root / L"shaders", ec);
+    log(L"created  " + text(root / L"shaders"));
+
+    fs::create_directories(save, ec);
+    if (!fs::is_directory(save, ec))
+        fail(L"Cannot create the save folder " + text(save));
+    if (opt.copy_saves_from && !same_path(*opt.copy_saves_from, save)) {
+        for (const wchar_t* f : kSaveFolders) {
+            fs::path from = *opt.copy_saves_from / f;
+            if (!fs::is_directory(from, ec))
+                continue;
+            fs::copy(from, save / f, fs::copy_options::recursive | fs::copy_options::skip_existing, ec);
+            if (ec)
+                fail(L"Cannot copy " + text(from) + L" to " + text(save) + L": " + widen(ec.message()));
+        }
+        log(L"copied   saves from " + text(*opt.copy_saves_from));
+    }
+    // The game reads the save folder's settings.ini once it has one (the in-game Display Settings
+    // write it), else this folder's: set both.
+    if (opt.skip_intro) {
+        const std::wstring value = *opt.skip_intro ? L"1" : L"0";
+        for (const fs::path& ini : {settings, save / L"settings.ini"}) {
+            if (!fs::is_regular_file(ini, ec))
+                continue;
+            write_setting(ini, L"skip_intro", value);
+            log(L"set      skip_intro=" + value + L" in " + text(ini));
+        }
+    }
+    write_paths(root / L"paths.ini", game, save, dlc);
+    log(L"wrote    paths.ini (game " + text(game) + L", save " + text(save) +
+        (dlc.empty() ? L"" : L", dlc " + text(dlc)) + L")");
+    // The per-user copy, for the next release unpacked elsewhere; the game runs without it.
+    if (fs::path user = user_paths_ini(); !user.empty()) {
+        try {
+            fs::create_directories(user.parent_path(), ec);
+            write_paths(user, clean(game), clean(save), dlc);
+            log(L"wrote    " + text(user));
+        } catch (const Error& e) {
+            log(L"skipped  " + text(user) + L" (" + e.message + L")");
+        }
+    }
+    step(1.0, L"Ready");
+    return exe;
+}
+
+// A desktop entry that starts the game in its folder; executable, which desktops ask of entries on
+// the Desktop before they trust them.
+void create_shortcut(const fs::path& target, const fs::path& lnk) {
+    std::error_code ec;
+    fs::path folder = target.parent_path();
+    std::string entry = "[Desktop Entry]\n"
+                        "Type=Application\n"
+                        "Name=Tempest\n"
+                        "Exec=" + desktop_quote(target.native()) + "\n"
+                        "Path=" + folder.native() + "\n"
+                        "Terminal=false\n"
+                        "Categories=Game;\n";
+    if (fs::path icon = folder / "tempest.png"; fs::is_regular_file(icon, ec))
+        entry += "Icon=" + icon.native() + "\n";
+    fs::create_directories(lnk.parent_path(), ec);
+    write_text(lnk, entry);
+    fs::permissions(lnk, fs::perms::owner_exec | fs::perms::group_exec | fs::perms::others_exec,
+                    fs::perm_options::add, ec);
+}
+
+// XDG_DESKTOP_DIR of ~/.config/user-dirs.dirs (xdg-user-dirs), else ~/Desktop.
+fs::path desktop_folder() {
+    const char* config = std::getenv("XDG_CONFIG_HOME");
+    fs::path dirs = (config && config[0] ? fs::path(config) : home() / ".config") / "user-dirs.dirs";
+    std::ifstream f(dirs);
+    for (std::string line; std::getline(f, line);) {
+        constexpr std::string_view key = "XDG_DESKTOP_DIR=\"";
+        if (line.rfind(key, 0) != 0 || line.back() != '"')
+            continue;
+        std::string value = line.substr(key.size(), line.size() - key.size() - 1);
+        if (value.rfind("$HOME", 0) == 0)
+            return home() / fs::path(value.substr(5)).relative_path();
+        if (!value.empty() && value[0] == '/')
+            return value;
+    }
+    return home() / "Desktop";
+}
+
+fs::path applications_folder() {
+    const char* data = std::getenv("XDG_DATA_HOME");
+    return (data && data[0] ? fs::path(data) : home() / ".local" / "share") / "applications";
+}
+
+} // namespace setup
